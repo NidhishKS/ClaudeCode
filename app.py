@@ -1,5 +1,7 @@
 import json
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import dash
 import dash_bootstrap_components as dbc
@@ -10,10 +12,36 @@ import yfinance as yf
 from dash import Input, Output, State, callback_context, dcc, html
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Defaults & persistence
 # ---------------------------------------------------------------------------
 DEFAULT_INVESTMENTS = ["VIXL", "REAL", "JPM", "MSFT"]
 DEFAULT_WATCHLIST = ["DFEU", "RNMBY"]
+
+TICKERS_FILE = Path(__file__).parent / "tickers.json"
+
+
+def load_tickers():
+    """Load saved ticker lists from disk, falling back to defaults."""
+    if TICKERS_FILE.exists():
+        try:
+            with open(TICKERS_FILE, "r") as f:
+                data = json.load(f)
+            return (
+                data.get("investments", DEFAULT_INVESTMENTS),
+                data.get("watchlist", DEFAULT_WATCHLIST),
+            )
+        except (json.JSONDecodeError, OSError):
+            pass
+    return DEFAULT_INVESTMENTS[:], DEFAULT_WATCHLIST[:]
+
+
+def save_tickers(investments, watchlist):
+    """Persist current ticker lists to disk."""
+    with open(TICKERS_FILE, "w") as f:
+        json.dump({"investments": investments, "watchlist": watchlist}, f, indent=2)
+
+
+SAVED_INVESTMENTS, SAVED_WATCHLIST = load_tickers()
 
 # ---------------------------------------------------------------------------
 # Data helpers
@@ -201,8 +229,8 @@ app.layout = dbc.Container(
     className="py-3",
     children=[
         # Stores for ticker lists
-        dcc.Store(id="investments-store", data=DEFAULT_INVESTMENTS),
-        dcc.Store(id="watchlist-store", data=DEFAULT_WATCHLIST),
+        dcc.Store(id="investments-store", data=SAVED_INVESTMENTS),
+        dcc.Store(id="watchlist-store", data=SAVED_WATCHLIST),
         # Header
         dbc.Row(
             dbc.Col(
@@ -378,15 +406,18 @@ def update_period(*_):
 )
 def manage_investments(add_clicks, remove_clicks, new_ticker, current):
     triggered = callback_context.triggered_id
+    updated = current
     if triggered == "inv-add-btn":
         if new_ticker:
             ticker = new_ticker.strip().upper()
             if ticker and ticker not in current:
-                return current + [ticker]
+                updated = current + [ticker]
     elif isinstance(triggered, dict) and triggered.get("type") == "inv-remove":
         ticker = triggered["ticker"]
-        return [t for t in current if t != ticker]
-    return current
+        updated = [t for t in current if t != ticker]
+    if updated is not current:
+        save_tickers(updated, load_tickers()[1])
+    return updated
 
 
 @app.callback(
@@ -399,15 +430,18 @@ def manage_investments(add_clicks, remove_clicks, new_ticker, current):
 )
 def manage_watchlist(add_clicks, remove_clicks, new_ticker, current):
     triggered = callback_context.triggered_id
+    updated = current
     if triggered == "watch-add-btn":
         if new_ticker:
             ticker = new_ticker.strip().upper()
             if ticker and ticker not in current:
-                return current + [ticker]
+                updated = current + [ticker]
     elif isinstance(triggered, dict) and triggered.get("type") == "watch-remove":
         ticker = triggered["ticker"]
-        return [t for t in current if t != ticker]
-    return current
+        updated = [t for t in current if t != ticker]
+    if updated is not current:
+        save_tickers(load_tickers()[0], updated)
+    return updated
 
 
 # --- Render ticker badges ---

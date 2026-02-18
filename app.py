@@ -1,6 +1,6 @@
+import io
 import json
-import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import dash
@@ -47,7 +47,8 @@ SAVED_INVESTMENTS, SAVED_WATCHLIST = load_tickers()
 # Data helpers
 # ---------------------------------------------------------------------------
 
-def fetch_data(tickers, period="6mo"):
+
+def fetch_data(tickers, period="1y"):
     """Download adjusted-close data for a list of tickers."""
     if not tickers:
         return pd.DataFrame()
@@ -55,30 +56,62 @@ def fetch_data(tickers, period="6mo"):
         df = yf.download(tickers, period=period, progress=False, auto_adjust=True)
         if df.empty:
             return pd.DataFrame()
-        # yf.download returns multi-level columns when >1 ticker
         if isinstance(df.columns, pd.MultiIndex):
             df = df["Close"]
         else:
-            # Single ticker – rename column
             df = df[["Close"]].rename(columns={"Close": tickers[0]})
+        # Only keep the exact tickers requested (prevents cross-contamination)
+        valid_cols = [t for t in tickers if t in df.columns]
+        df = df[valid_cols]
         return df.dropna(how="all")
     except Exception:
         return pd.DataFrame()
 
 
-def compute_returns(prices):
-    """Return dict of DataFrames: daily, weekly, monthly returns (%)."""
+def slice_by_period(prices, period):
+    """Slice a prices DataFrame to the given period from the end."""
     if prices.empty:
-        return {}, {}, {}
+        return prices
+    end = prices.index[-1]
+    period_map = {
+        "1w": timedelta(days=7),
+        "1mo": timedelta(days=30),
+        "3mo": timedelta(days=90),
+        "6mo": timedelta(days=180),
+        "1y": timedelta(days=365),
+    }
+    delta = period_map.get(period, timedelta(days=180))
+    start = end - delta
+    return prices[prices.index >= start]
+
+
+def restore_prices(data_json):
+    """Restore a prices DataFrame from its JSON representation."""
+    if not data_json:
+        return pd.DataFrame()
+    prices = pd.read_json(io.StringIO(data_json), orient="split")
+    prices.index = pd.to_datetime(prices.index)
+    return prices
+
+
+def compute_returns(prices):
+    """Return DataFrames: daily, weekly, monthly returns (%)."""
+    if prices.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     daily = prices.pct_change().iloc[1:] * 100
     weekly = prices.resample("W-FRI").last().pct_change().iloc[1:] * 100
     monthly = prices.resample("ME").last().pct_change().iloc[1:] * 100
     return daily, weekly, monthly
 
 
-def make_heatmap(returns_df, title, last_n=None):
+# ---------------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------------
+
+
+def make_heatmap(returns_df, title, last_n=7):
     """Build a Plotly heatmap figure from a returns DataFrame."""
-    if returns_df is None or returns_df.empty:
+    if not isinstance(returns_df, pd.DataFrame) or returns_df.empty:
         fig = go.Figure()
         fig.update_layout(
             title=title,
@@ -92,7 +125,6 @@ def make_heatmap(returns_df, title, last_n=None):
     if last_n and len(df) > last_n:
         df = df.iloc[-last_n:]
 
-    # Format dates
     date_labels = [d.strftime("%Y-%m-%d") for d in df.index]
 
     fig = go.Figure(
@@ -159,10 +191,49 @@ def make_price_chart(prices, title):
     return fig
 
 
+def make_individual_chart(prices, ticker):
+    """Build a raw (non-indexed) price chart for a single ticker."""
+    if prices is None or prices.empty or ticker not in prices.columns:
+        fig = go.Figure()
+        fig.update_layout(
+            annotations=[
+                dict(text="Select a ticker above", showarrow=False, font=dict(size=14))
+            ],
+            height=400,
+        )
+        return fig
+
+    s = prices[ticker].dropna()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=ticker))
+    fig.update_layout(
+        title=f"{ticker} Price",
+        xaxis_title="Date",
+        yaxis_title="Price ($)",
+        hovermode="x unified",
+        height=400,
+        margin=dict(l=60, r=40, t=60, b=60),
+    )
+    return fig
+
+
+def _calc_return(series, days):
+    """Calculate return over approximately `days` calendar days."""
+    cutoff = series.index[-1] - timedelta(days=days)
+    vals = series[series.index >= cutoff]
+    if len(vals) >= 2:
+        return ((vals.iloc[-1] / vals.iloc[0]) - 1) * 100
+    return 0.0
+
+
 def make_summary_table(prices):
     """Return a summary table with latest price and period returns."""
     if prices is None or prices.empty:
         return html.Div("No data available", className="text-muted p-3")
+
+    def color_cell(val):
+        color = "#2e7d32" if val >= 0 else "#d32f2f"
+        return html.Td(f"{val:+.2f}%", style={"color": color, "fontWeight": "600"})
 
     rows = []
     for ticker in prices.columns:
@@ -170,26 +241,26 @@ def make_summary_table(prices):
         if len(s) < 2:
             continue
         latest = s.iloc[-1]
-        day_ret = ((s.iloc[-1] / s.iloc[-2]) - 1) * 100 if len(s) >= 2 else 0
-        week_ago = s.index[-1] - timedelta(days=7)
-        week_vals = s[s.index >= week_ago]
-        week_ret = ((week_vals.iloc[-1] / week_vals.iloc[0]) - 1) * 100 if len(week_vals) >= 2 else 0
-        month_ago = s.index[-1] - timedelta(days=30)
-        month_vals = s[s.index >= month_ago]
-        month_ret = ((month_vals.iloc[-1] / month_vals.iloc[0]) - 1) * 100 if len(month_vals) >= 2 else 0
-
-        def color_cell(val):
-            color = "#2e7d32" if val >= 0 else "#d32f2f"
-            return html.Td(f"{val:+.2f}%", style={"color": color, "fontWeight": "600"})
+        day_ret = ((s.iloc[-1] / s.iloc[-2]) - 1) * 100
+        week_ret = _calc_return(s, 7)
+        month_ret = _calc_return(s, 30)
+        three_month_ret = _calc_return(s, 90)
+        six_month_ret = _calc_return(s, 180)
+        year_ret = _calc_return(s, 365)
 
         rows.append(
-            html.Tr([
-                html.Td(ticker, style={"fontWeight": "700"}),
-                html.Td(f"${latest:.2f}"),
-                color_cell(day_ret),
-                color_cell(week_ret),
-                color_cell(month_ret),
-            ])
+            html.Tr(
+                [
+                    html.Td(ticker, style={"fontWeight": "700"}),
+                    html.Td(f"${latest:.2f}"),
+                    color_cell(day_ret),
+                    color_cell(week_ret),
+                    color_cell(month_ret),
+                    color_cell(three_month_ret),
+                    color_cell(six_month_ret),
+                    color_cell(year_ret),
+                ]
+            )
         )
 
     if not rows:
@@ -198,13 +269,18 @@ def make_summary_table(prices):
     return dbc.Table(
         [
             html.Thead(
-                html.Tr([
-                    html.Th("Ticker"),
-                    html.Th("Price"),
-                    html.Th("1D"),
-                    html.Th("1W"),
-                    html.Th("1M"),
-                ])
+                html.Tr(
+                    [
+                        html.Th("Ticker"),
+                        html.Th("Price"),
+                        html.Th("1D"),
+                        html.Th("1W"),
+                        html.Th("1M"),
+                        html.Th("3M"),
+                        html.Th("6M"),
+                        html.Th("1Y"),
+                    ]
+                )
             ),
             html.Tbody(rows),
         ],
@@ -212,11 +288,12 @@ def make_summary_table(prices):
         hover=True,
         size="sm",
         className="mb-0",
+        responsive=True,
     )
 
 
 # ---------------------------------------------------------------------------
-# App layout
+# App & layout
 # ---------------------------------------------------------------------------
 app = dash.Dash(
     __name__,
@@ -224,13 +301,103 @@ app = dash.Dash(
     title="Stock & ETF Dashboard",
 )
 
+
+def _period_btn_group(prefix, color="primary"):
+    """Create a 1W / 1M / 3M / 6M / 1Y button group for charts."""
+    periods = [("1W", "1w"), ("1M", "1mo"), ("3M", "3mo"), ("6M", "6mo"), ("1Y", "1y")]
+    buttons = []
+    for label, key in periods:
+        is_default = key == "6mo"
+        buttons.append(
+            dbc.Button(
+                label,
+                id=f"{prefix}-btn-{key}",
+                n_clicks=0,
+                outline=not is_default,
+                color=color,
+                size="sm",
+            )
+        )
+    return dbc.ButtonGroup(buttons, className="mb-2")
+
+
+def make_panel(prefix, title):
+    """Create the layout for one panel (investments or watchlist)."""
+    return dbc.Card(
+        [
+            dbc.CardHeader(html.H5(title, className="mb-0")),
+            dbc.CardBody(
+                [
+                    # Ticker management
+                    dbc.InputGroup(
+                        [
+                            dbc.Input(
+                                id=f"{prefix}-input",
+                                placeholder="Add ticker (e.g. AAPL)",
+                                type="text",
+                            ),
+                            dbc.Button(
+                                "Add",
+                                id=f"{prefix}-add-btn",
+                                color="success",
+                                n_clicks=0,
+                            ),
+                        ],
+                        className="mb-2",
+                        size="sm",
+                    ),
+                    html.Div(id=f"{prefix}-badges", className="mb-3"),
+                    # Summary table
+                    html.Div(id=f"{prefix}-summary"),
+                    # Portfolio performance chart
+                    html.H6("Portfolio Performance", className="mt-3 mb-2"),
+                    _period_btn_group(f"{prefix}-chart", color="primary"),
+                    dcc.Store(id=f"{prefix}-chart-period", data="6mo"),
+                    dcc.Loading(dcc.Graph(id=f"{prefix}-price-chart")),
+                    # Individual stock chart
+                    html.H6("Individual Stock", className="mt-3 mb-2"),
+                    dcc.Dropdown(
+                        id=f"{prefix}-ind-dropdown",
+                        placeholder="Select a ticker...",
+                        className="mb-2",
+                    ),
+                    _period_btn_group(f"{prefix}-ind", color="secondary"),
+                    dcc.Store(id=f"{prefix}-ind-period", data="6mo"),
+                    dcc.Loading(dcc.Graph(id=f"{prefix}-individual-chart")),
+                    # Heatmaps
+                    dbc.Tabs(
+                        [
+                            dbc.Tab(
+                                dcc.Loading(dcc.Graph(id=f"{prefix}-heatmap-daily")),
+                                label="Daily",
+                            ),
+                            dbc.Tab(
+                                dcc.Loading(dcc.Graph(id=f"{prefix}-heatmap-weekly")),
+                                label="Weekly",
+                            ),
+                            dbc.Tab(
+                                dcc.Loading(dcc.Graph(id=f"{prefix}-heatmap-monthly")),
+                                label="Monthly",
+                            ),
+                        ],
+                        className="mt-3",
+                    ),
+                ]
+            ),
+        ],
+        className="shadow-sm",
+    )
+
+
 app.layout = dbc.Container(
     fluid=True,
     className="py-3",
     children=[
-        # Stores for ticker lists
+        # Stores for ticker lists & cached price data
         dcc.Store(id="investments-store", data=SAVED_INVESTMENTS),
         dcc.Store(id="watchlist-store", data=SAVED_WATCHLIST),
+        dcc.Store(id="inv-data-store"),
+        dcc.Store(id="watch-data-store"),
         # Header
         dbc.Row(
             dbc.Col(
@@ -240,122 +407,11 @@ app.layout = dbc.Container(
                 ),
             )
         ),
-        # Time-range selector
-        dbc.Row(
-            dbc.Col(
-                dbc.ButtonGroup(
-                    [
-                        dbc.Button("1 Month", id="btn-1mo", n_clicks=0, outline=True, color="primary"),
-                        dbc.Button("3 Months", id="btn-3mo", n_clicks=0, outline=True, color="primary"),
-                        dbc.Button("6 Months", id="btn-6mo", n_clicks=0, color="primary"),
-                        dbc.Button("1 Year", id="btn-1y", n_clicks=0, outline=True, color="primary"),
-                    ],
-                    className="mb-3",
-                ),
-                width="auto",
-                className="d-flex justify-content-center",
-            )
-        ),
-        dcc.Store(id="period-store", data="6mo"),
         # Two-panel layout
         dbc.Row(
             [
-                # ---- Current Investments ----
-                dbc.Col(
-                    dbc.Card(
-                        [
-                            dbc.CardHeader(html.H5("Current Investments", className="mb-0")),
-                            dbc.CardBody(
-                                [
-                                    # Ticker management
-                                    dbc.InputGroup(
-                                        [
-                                            dbc.Input(
-                                                id="inv-input",
-                                                placeholder="Add ticker (e.g. AAPL)",
-                                                type="text",
-                                            ),
-                                            dbc.Button("Add", id="inv-add-btn", color="success", n_clicks=0),
-                                        ],
-                                        className="mb-2",
-                                        size="sm",
-                                    ),
-                                    html.Div(id="inv-badges", className="mb-3"),
-                                    # Summary table
-                                    html.Div(id="inv-summary"),
-                                    # Chart
-                                    dcc.Loading(dcc.Graph(id="inv-price-chart")),
-                                    # Heatmap tabs
-                                    dbc.Tabs(
-                                        [
-                                            dbc.Tab(
-                                                dcc.Loading(dcc.Graph(id="inv-heatmap-daily")),
-                                                label="Daily",
-                                            ),
-                                            dbc.Tab(
-                                                dcc.Loading(dcc.Graph(id="inv-heatmap-weekly")),
-                                                label="Weekly",
-                                            ),
-                                            dbc.Tab(
-                                                dcc.Loading(dcc.Graph(id="inv-heatmap-monthly")),
-                                                label="Monthly",
-                                            ),
-                                        ],
-                                        className="mt-3",
-                                    ),
-                                ]
-                            ),
-                        ],
-                        className="shadow-sm",
-                    ),
-                    lg=6,
-                ),
-                # ---- Watchlist ----
-                dbc.Col(
-                    dbc.Card(
-                        [
-                            dbc.CardHeader(html.H5("Watchlist", className="mb-0")),
-                            dbc.CardBody(
-                                [
-                                    dbc.InputGroup(
-                                        [
-                                            dbc.Input(
-                                                id="watch-input",
-                                                placeholder="Add ticker (e.g. TSLA)",
-                                                type="text",
-                                            ),
-                                            dbc.Button("Add", id="watch-add-btn", color="success", n_clicks=0),
-                                        ],
-                                        className="mb-2",
-                                        size="sm",
-                                    ),
-                                    html.Div(id="watch-badges", className="mb-3"),
-                                    html.Div(id="watch-summary"),
-                                    dcc.Loading(dcc.Graph(id="watch-price-chart")),
-                                    dbc.Tabs(
-                                        [
-                                            dbc.Tab(
-                                                dcc.Loading(dcc.Graph(id="watch-heatmap-daily")),
-                                                label="Daily",
-                                            ),
-                                            dbc.Tab(
-                                                dcc.Loading(dcc.Graph(id="watch-heatmap-weekly")),
-                                                label="Weekly",
-                                            ),
-                                            dbc.Tab(
-                                                dcc.Loading(dcc.Graph(id="watch-heatmap-monthly")),
-                                                label="Monthly",
-                                            ),
-                                        ],
-                                        className="mt-3",
-                                    ),
-                                ]
-                            ),
-                        ],
-                        className="shadow-sm",
-                    ),
-                    lg=6,
-                ),
+                dbc.Col(make_panel("inv", "Current Investments"), lg=6),
+                dbc.Col(make_panel("watch", "Watchlist"), lg=6),
             ]
         ),
         # Footer
@@ -374,28 +430,9 @@ app.layout = dbc.Container(
 # Callbacks
 # ---------------------------------------------------------------------------
 
-# Period selector
-@app.callback(
-    Output("period-store", "data"),
-    Output("btn-1mo", "outline"),
-    Output("btn-3mo", "outline"),
-    Output("btn-6mo", "outline"),
-    Output("btn-1y", "outline"),
-    Input("btn-1mo", "n_clicks"),
-    Input("btn-3mo", "n_clicks"),
-    Input("btn-6mo", "n_clicks"),
-    Input("btn-1y", "n_clicks"),
-    prevent_initial_call=True,
-)
-def update_period(*_):
-    btn = callback_context.triggered_id
-    mapping = {"btn-1mo": "1mo", "btn-3mo": "3mo", "btn-6mo": "6mo", "btn-1y": "1y"}
-    period = mapping.get(btn, "6mo")
-    outlines = [btn != b for b in mapping]
-    return (period, *outlines)
+# --- Ticker management ---
 
 
-# --- Investment ticker management ---
 @app.callback(
     Output("investments-store", "data"),
     Input("inv-add-btn", "n_clicks"),
@@ -421,7 +458,7 @@ def manage_investments(add_clicks, remove_clicks, new_ticker, current):
 
 
 @app.callback(
-    Output("watch-store", "data") if False else Output("watchlist-store", "data"),
+    Output("watchlist-store", "data"),
     Input("watch-add-btn", "n_clicks"),
     Input({"type": "watch-remove", "ticker": dash.ALL}, "n_clicks"),
     State("watch-input", "value"),
@@ -445,6 +482,8 @@ def manage_watchlist(add_clicks, remove_clicks, new_ticker, current):
 
 
 # --- Render ticker badges ---
+
+
 def render_badges(tickers, badge_type):
     badges = []
     for t in tickers:
@@ -456,7 +495,11 @@ def render_badges(tickers, badge_type):
                         "\u00d7",
                         id={"type": f"{badge_type}-remove", "ticker": t},
                         n_clicks=0,
-                        style={"cursor": "pointer", "marginLeft": "4px", "fontSize": "1rem"},
+                        style={
+                            "cursor": "pointer",
+                            "marginLeft": "4px",
+                            "fontSize": "1rem",
+                        },
                     ),
                 ],
                 color="primary",
@@ -476,7 +519,9 @@ def show_watch_badges(tickers):
     return render_badges(tickers, "watch")
 
 
-# Clear input after adding
+# --- Clear input after adding ---
+
+
 @app.callback(
     Output("inv-input", "value"),
     Input("inv-add-btn", "n_clicks"),
@@ -495,47 +540,137 @@ def clear_watch_input(_):
     return ""
 
 
-# --- Main data callbacks ---
-@app.callback(
-    Output("inv-summary", "children"),
-    Output("inv-price-chart", "figure"),
-    Output("inv-heatmap-daily", "figure"),
-    Output("inv-heatmap-weekly", "figure"),
-    Output("inv-heatmap-monthly", "figure"),
-    Input("investments-store", "data"),
-    Input("period-store", "data"),
-)
-def update_investments(tickers, period):
-    prices = fetch_data(tickers, period)
-    daily, weekly, monthly = compute_returns(prices)
-    return (
-        make_summary_table(prices),
-        make_price_chart(prices, "Investment Performance (Indexed)"),
-        make_heatmap(daily, "Daily Returns (%)", last_n=30),
-        make_heatmap(weekly, "Weekly Returns (%)"),
-        make_heatmap(monthly, "Monthly Returns (%)"),
-    )
+# --- Data caching: fetch 1y data once when tickers change ---
 
 
-@app.callback(
-    Output("watch-summary", "children"),
-    Output("watch-price-chart", "figure"),
-    Output("watch-heatmap-daily", "figure"),
-    Output("watch-heatmap-weekly", "figure"),
-    Output("watch-heatmap-monthly", "figure"),
-    Input("watchlist-store", "data"),
-    Input("period-store", "data"),
-)
-def update_watchlist(tickers, period):
-    prices = fetch_data(tickers, period)
-    daily, weekly, monthly = compute_returns(prices)
-    return (
-        make_summary_table(prices),
-        make_price_chart(prices, "Watchlist Performance (Indexed)"),
-        make_heatmap(daily, "Daily Returns (%)", last_n=30),
-        make_heatmap(weekly, "Weekly Returns (%)"),
-        make_heatmap(monthly, "Monthly Returns (%)"),
+@app.callback(Output("inv-data-store", "data"), Input("investments-store", "data"))
+def cache_inv_data(tickers):
+    prices = fetch_data(tickers, "1y")
+    if prices.empty:
+        return None
+    return prices.to_json(date_format="iso", orient="split")
+
+
+@app.callback(Output("watch-data-store", "data"), Input("watchlist-store", "data"))
+def cache_watch_data(tickers):
+    prices = fetch_data(tickers, "1y")
+    if prices.empty:
+        return None
+    return prices.to_json(date_format="iso", orient="split")
+
+
+# --- Panel-specific callbacks (registered via factory) ---
+
+
+def register_panel_callbacks(prefix, data_store_id, chart_title, tickers_store_id):
+    """Register all display callbacks for a panel."""
+
+    chart_btn_ids = [f"{prefix}-chart-btn-{p}" for p in ["1w", "1mo", "3mo", "6mo", "1y"]]
+    chart_periods = ["1w", "1mo", "3mo", "6mo", "1y"]
+
+    # Chart period selector
+    @app.callback(
+        Output(f"{prefix}-chart-period", "data"),
+        *[Output(bid, "outline") for bid in chart_btn_ids],
+        *[Input(bid, "n_clicks") for bid in chart_btn_ids],
+        prevent_initial_call=True,
     )
+    def update_chart_period(*_, _ids=chart_btn_ids, _periods=chart_periods):
+        btn = callback_context.triggered_id
+        mapping = dict(zip(_ids, _periods))
+        period = mapping.get(btn, "6mo")
+        outlines = [btn != b for b in _ids]
+        return (period, *outlines)
+
+    # Individual chart period selector
+    ind_btn_ids = [f"{prefix}-ind-btn-{p}" for p in ["1w", "1mo", "3mo", "6mo", "1y"]]
+
+    @app.callback(
+        Output(f"{prefix}-ind-period", "data"),
+        *[Output(bid, "outline") for bid in ind_btn_ids],
+        *[Input(bid, "n_clicks") for bid in ind_btn_ids],
+        prevent_initial_call=True,
+    )
+    def update_ind_period(*_, _ids=ind_btn_ids, _periods=chart_periods):
+        btn = callback_context.triggered_id
+        mapping = dict(zip(_ids, _periods))
+        period = mapping.get(btn, "6mo")
+        outlines = [btn != b for b in _ids]
+        return (period, *outlines)
+
+    # Update dropdown options when tickers change
+    @app.callback(
+        Output(f"{prefix}-ind-dropdown", "options"),
+        Input(tickers_store_id, "data"),
+    )
+    def update_dropdown(tickers):
+        return [{"label": t, "value": t} for t in (tickers or [])]
+
+    # Table + heatmaps (use full 1y cached data)
+    @app.callback(
+        Output(f"{prefix}-summary", "children"),
+        Output(f"{prefix}-heatmap-daily", "figure"),
+        Output(f"{prefix}-heatmap-weekly", "figure"),
+        Output(f"{prefix}-heatmap-monthly", "figure"),
+        Input(data_store_id, "data"),
+    )
+    def update_table_heatmaps(data_json):
+        prices = restore_prices(data_json)
+        daily, weekly, monthly = compute_returns(prices)
+        return (
+            make_summary_table(prices),
+            make_heatmap(daily, "Daily Returns (%)", last_n=7),
+            make_heatmap(weekly, "Weekly Returns (%)", last_n=7),
+            make_heatmap(monthly, "Monthly Returns (%)", last_n=7),
+        )
+
+    # Portfolio performance chart (responds to its own period buttons)
+    _chart_title = chart_title
+
+    @app.callback(
+        Output(f"{prefix}-price-chart", "figure"),
+        Input(data_store_id, "data"),
+        Input(f"{prefix}-chart-period", "data"),
+    )
+    def update_price_chart(data_json, period, _title=_chart_title):
+        prices = restore_prices(data_json)
+        if not prices.empty:
+            prices = slice_by_period(prices, period)
+        return make_price_chart(prices, _title)
+
+    # Individual stock chart
+    @app.callback(
+        Output(f"{prefix}-individual-chart", "figure"),
+        Input(data_store_id, "data"),
+        Input(f"{prefix}-ind-dropdown", "value"),
+        Input(f"{prefix}-ind-period", "data"),
+    )
+    def update_individual_chart(data_json, selected_ticker, period):
+        if not selected_ticker:
+            fig = go.Figure()
+            fig.update_layout(
+                annotations=[
+                    dict(
+                        text="Select a ticker above",
+                        showarrow=False,
+                        font=dict(size=14),
+                    )
+                ],
+                height=400,
+            )
+            return fig
+        prices = restore_prices(data_json)
+        if not prices.empty:
+            prices = slice_by_period(prices, period)
+        return make_individual_chart(prices, selected_ticker)
+
+
+register_panel_callbacks(
+    "inv", "inv-data-store", "Investment Performance (Indexed)", "investments-store"
+)
+register_panel_callbacks(
+    "watch", "watch-data-store", "Watchlist Performance (Indexed)", "watchlist-store"
+)
 
 
 # ---------------------------------------------------------------------------

@@ -323,10 +323,10 @@ def xgboost_shap(df):
     model_full = xgb.XGBRegressor(**best_params, verbosity=0)
     model_full.fit(X, y)
 
-    # SHAP values — use shap.Explainer (version-agnostic) to avoid
-    # UTF-8 decode errors that affect TreeExplainer with newer XGBoost builds
-    explainer  = shap.Explainer(model_full, X)
-    shap_vals  = explainer(X).values                 # shape: (n_obs, n_features)
+    # SHAP values — pass the raw booster to TreeExplainer to sidestep
+    # version-mismatch issues between the XGBRegressor wrapper and SHAP
+    explainer  = shap.TreeExplainer(model_full.get_booster())
+    shap_vals  = explainer.shap_values(X)            # shape: (n_obs, n_features)
     mean_abs   = np.abs(shap_vals).mean(axis=0)
     ranks_shap = {feature_cols[i]: int(np.argsort(-mean_abs)[list(np.argsort(-mean_abs)).index(i)] + 1)
                   for i in range(len(feature_cols))}

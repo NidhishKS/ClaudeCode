@@ -498,7 +498,102 @@ def markov_switching(df):
     for col in order_ms:
         print(f"  {col:20s}: avg |β| = {var_avg_coef[col]:.4f}  Rank {ranks_ms[col]}")
 
-    return coef_table, regime_shares, ranks_ms
+    return coef_table, regime_shares, ranks_ms, smoothed_probs
+
+
+# ──────────────────────────────────────────────────────────────
+# 5b. REGIME DEEP-DIVE
+# ──────────────────────────────────────────────────────────────
+
+def regime_analysis(df_stat, smoothed_probs):
+    """
+    Uses the smoothed regime probabilities from the Markov-switching model
+    to label every observation, then exports a CSV, prints episode date
+    ranges, prints summary statistics by regime, and produces a timeline plot.
+    """
+    print("\n══════════════════════════════════════")
+    print("REGIME DEEP-DIVE")
+    print("══════════════════════════════════════")
+
+    all_cols = ["core_goods_yoy", "energy_yoy", "inf_exp", "wages_yoy"]
+
+    # ── 1. Build classified dataframe ──
+    prob_r0 = smoothed_probs.iloc[:, 0].values          # P(Regime 0 | data)
+    regime_label = np.where(prob_r0 > 0.5, 0, 1)
+
+    clf = df_stat[all_cols].copy()
+    clf["P_regime0"]    = prob_r0
+    clf["regime"]       = regime_label
+
+    clf.to_csv(f"{OUTPUT_DIR}/regime_classifications.csv")
+    print(f"Saved: {OUTPUT_DIR}/regime_classifications.csv  ({len(clf)} rows)")
+
+    # ── 2. Contiguous Regime 0 date blocks ──
+    print("\nRegime 0 episodes (P(Regime 0) > 0.5):")
+    in_r0    = (regime_label == 0)
+    # find edges
+    starts, ends = [], []
+    for i in range(len(in_r0)):
+        if in_r0[i] and (i == 0 or not in_r0[i - 1]):
+            starts.append(i)
+        if in_r0[i] and (i == len(in_r0) - 1 or not in_r0[i + 1]):
+            ends.append(i)
+
+    dates = clf.index
+    for s, e in zip(starts, ends):
+        n_months = e - s + 1
+        print(f"  Regime 0: {dates[s].strftime('%Y-%m')} to "
+              f"{dates[e].strftime('%Y-%m')} ({n_months} months)")
+
+    # ── 3. Summary statistics by regime ──
+    print("\nSummary statistics by regime:")
+    stats = clf.groupby("regime")[all_cols].agg(["mean", "std"]).round(3)
+    # Flatten multi-level columns for clean printing
+    stats.columns = [f"{col}_{stat}" for col, stat in stats.columns]
+    for r in [0, 1]:
+        print(f"\n  Regime {r}  (n={int((regime_label==r).sum())} obs):")
+        for col in all_cols:
+            mu  = stats.loc[r, f"{col}_mean"]
+            sig = stats.loc[r, f"{col}_std"]
+            print(f"    {col:20s}  mean={mu:7.3f}  std={sig:6.3f}")
+
+    # ── 4. Timeline plot ──
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6),
+                                   sharex=True,
+                                   gridspec_kw={"height_ratios": [2, 1]})
+
+    # Panel 1: core goods inflation shaded by regime
+    ax1.plot(dates, clf["core_goods_yoy"], color="navy", lw=1.2,
+             label="Core Goods Inflation (YoY %)", zorder=3)
+    ax1.axhline(0, color="grey", lw=0.5, ls="--", zorder=1)
+
+    # Shade Regime 0 blocks
+    first_r0 = True
+    for s, e in zip(starts, ends):
+        label = "Regime 0" if first_r0 else "_nolegend_"
+        ax1.axvspan(dates[s], dates[e],
+                    alpha=0.25, color="tomato", label=label, zorder=2)
+        first_r0 = False
+
+    ax1.set_ylabel("YoY %")
+    ax1.set_title("Core Goods Inflation: Regime Timeline\n"
+                  "(red shading = Regime 0, unshaded = Regime 1)")
+    ax1.legend(fontsize=8, loc="upper left")
+
+    # Panel 2: smoothed P(Regime 0)
+    ax2.fill_between(dates, prob_r0, alpha=0.5, color="tomato", label="P(Regime 0)")
+    ax2.fill_between(dates, 1 - prob_r0, alpha=0.5, color="steelblue",
+                     label="P(Regime 1)")
+    ax2.axhline(0.5, color="black", lw=0.8, ls="--")
+    ax2.set_ylim(0, 1)
+    ax2.set_ylabel("Smoothed Probability")
+    ax2.set_xlabel("Date")
+    ax2.legend(fontsize=8, loc="upper left")
+
+    plt.tight_layout()
+    fig.savefig(f"{OUTPUT_DIR}/4b_regime_timeline.png", dpi=150)
+    plt.close(fig)
+    print(f"\nSaved: {OUTPUT_DIR}/4b_regime_timeline.png")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -584,7 +679,8 @@ def main():
     shapley_df            = shapley_r2(df_stat)
     fevd_table, ranks_fevd = var_fevd(df_stat)
     shap_df, ranks_shap   = xgboost_shap(df_stat)
-    _, regime_shares, ranks_ms = markov_switching(df_stat)
+    _, regime_shares, ranks_ms, smoothed_probs = markov_switching(df_stat)
+    regime_analysis(df_stat, smoothed_probs)
 
     # 3. Print consolidated summary
     summary = print_summary(shapley_df, ranks_fevd, shap_df, ranks_ms)

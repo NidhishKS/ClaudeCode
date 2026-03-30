@@ -51,13 +51,12 @@ def fetch_data():
         sys.exit("ERROR: FRED_API_KEY environment variable not set.")
 
     fred = Fred(api_key=api_key)
-    start, end = "2000-01-01", "2025-12-31"
 
-    print("Fetching FRED series...")
-    core_goods_raw  = fred.get_series("CUSR0000SACL1E",  observation_start=start, observation_end=end)
-    energy_raw      = fred.get_series("CPIENGSL",        observation_start=start, observation_end=end)
-    inf_exp         = fred.get_series("MICH",            observation_start=start, observation_end=end)
-    wages_raw       = fred.get_series("A576RC1",         observation_start=start, observation_end=end)
+    print("Fetching FRED series (full history)...")
+    core_goods_raw  = fred.get_series("CUSR0000SACL1E")
+    energy_raw      = fred.get_series("CPIENGSL")
+    inf_exp         = fred.get_series("MICH")
+    wages_raw       = fred.get_series("A576RC1")
 
     # Convert all to monthly period index for clean alignment
     def to_monthly(s):

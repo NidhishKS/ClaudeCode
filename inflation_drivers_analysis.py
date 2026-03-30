@@ -323,10 +323,11 @@ def xgboost_shap(df):
     model_full = xgb.XGBRegressor(**best_params, verbosity=0)
     model_full.fit(X, y)
 
-    # SHAP values — pass the raw booster to TreeExplainer to sidestep
-    # version-mismatch issues between the XGBRegressor wrapper and SHAP
-    explainer  = shap.TreeExplainer(model_full.get_booster())
-    shap_vals  = explainer.shap_values(X)            # shape: (n_obs, n_features)
+    # SHAP values — use XGBoost's native pred_contribs instead of the shap
+    # library's TreeExplainer, which breaks on XGBoost 3.x / SHAP 0.43.
+    # pred_contribs returns (n_obs, n_features + 1); last col is the bias term.
+    dmat      = xgb.DMatrix(X, feature_names=feature_cols)
+    shap_vals = model_full.get_booster().predict(dmat, pred_contribs=True)[:, :-1]
     mean_abs   = np.abs(shap_vals).mean(axis=0)
     ranks_shap = {feature_cols[i]: int(np.argsort(-mean_abs)[list(np.argsort(-mean_abs)).index(i)] + 1)
                   for i in range(len(feature_cols))}

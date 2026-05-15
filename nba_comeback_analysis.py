@@ -112,9 +112,10 @@ def analyze_game(game_id: str) -> dict:
         print(f"    WARNING: Empty PBP for {game_id}")
         return result
 
-    q4 = pbp[pbp["PERIOD"] == 4].copy()
+    # PERIOD may come back as int or str depending on API version
+    q4 = pbp[pbp["PERIOD"].astype(str) == "4"].copy()
     if q4.empty:
-        print(f"    WARNING: No Q4 rows for {game_id}")
+        print(f"    WARNING: No Q4 rows for {game_id} (periods seen: {pbp['PERIOD'].unique().tolist()})")
         return result
 
     result["ok"] = True
@@ -185,6 +186,8 @@ def process_season(season: str) -> dict:
             game_info[gid]["winner_team_id"] = team_id
 
     total = len(game_ids)
+    skipped_info = 0
+    failed_pbp = 0
     print(f"  Processing {total} games for {season}...")
 
     for idx, game_id in enumerate(game_ids, 1):
@@ -193,7 +196,9 @@ def process_season(season: str) -> dict:
         winner_id = info.get("winner_team_id")
 
         if home_id is None or winner_id is None:
-            print(f"    SKIP {game_id}: incomplete team info")
+            skipped_info += 1
+            if skipped_info <= 3:  # avoid flooding console
+                print(f"    SKIP {game_id}: incomplete team info")
             continue
 
         home_team_won = home_id == winner_id
@@ -203,6 +208,7 @@ def process_season(season: str) -> dict:
 
         result = analyze_game(game_id)
         if not result["ok"]:
+            failed_pbp += 1
             continue
 
         stats["total_games"] += 1
@@ -302,10 +308,12 @@ def main():
             print(f"\n=== Season {season} ===")
             stats = process_season(season)
             all_stats.append(stats)
+            s = stats
             print(
-                f"  Done — {stats['total_games']} games | "
-                f"trailed 5+: {stats['games_trailed_5']} games, {stats['comeback_wins_5']} wins | "
-                f"trailed 10+: {stats['games_trailed_10']} games, {stats['comeback_wins_10']} wins"
+                f"  Done — {s['total_games']} games analysed "
+                f"(skipped {skipped_info} missing team info, {failed_pbp} PBP failures) | "
+                f"trailed 5+: {s['games_trailed_5']} games, {s['comeback_wins_5']} wins | "
+                f"trailed 10+: {s['games_trailed_10']} games, {s['comeback_wins_10']} wins"
             )
 
     print("\n========== NBA PLAYOFF Q4 COMEBACK ANALYSIS ==========\n")

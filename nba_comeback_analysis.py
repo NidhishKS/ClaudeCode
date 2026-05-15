@@ -15,7 +15,7 @@ import time
 import warnings
 import pandas as pd
 from tabulate import tabulate
-from nba_api.stats.endpoints import LeagueGameLog, PlayByPlayV2
+from nba_api.stats.endpoints import LeagueGameLog, PlayByPlayV3
 
 warnings.filterwarnings("ignore")
 
@@ -49,10 +49,10 @@ def fetch_playoff_games(season: str) -> pd.DataFrame:
 
 
 def fetch_play_by_play(game_id: str) -> pd.DataFrame:
-    """Return play-by-play rows for a single game."""
+    """Return play-by-play rows for a single game (PlayByPlayV3)."""
     for attempt in range(MAX_RETRIES):
         try:
-            pbp = PlayByPlayV2(game_id=game_id, timeout=60)
+            pbp = PlayByPlayV3(game_id=game_id, timeout=60)
             df = pbp.get_data_frames()[0]
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             return df
@@ -68,14 +68,10 @@ def fetch_play_by_play(game_id: str) -> pd.DataFrame:
 # Analysis logic
 # ---------------------------------------------------------------------------
 
-def parse_margin(val) -> float | None:
-    """Convert SCOREMARGIN value to float (home perspective). None = skip row."""
-    if pd.isna(val) or val == "" or val is None:
-        return None
-    if str(val).strip().upper() == "TIE":
-        return 0.0
+def compute_margin(score_home, score_away) -> float | None:
+    """Return home - away score margin. None if either score is missing."""
     try:
-        return float(val)
+        return float(score_home) - float(score_away)
     except (ValueError, TypeError):
         return None
 
@@ -113,16 +109,16 @@ def analyze_game(game_id: str) -> dict:
         print(f"    WARNING: Empty PBP for {game_id}")
         return result
 
-    # PERIOD may come back as int or str depending on API version
-    q4 = pbp[pbp["PERIOD"].astype(str) == "4"].copy()
+    # V3 uses lowercase 'period' column
+    q4 = pbp[pbp["period"].astype(str) == "4"].copy()
     if q4.empty:
-        print(f"    WARNING: No Q4 rows for {game_id} (periods seen: {pbp['PERIOD'].unique().tolist()})")
+        print(f"    WARNING: No Q4 rows for {game_id} (periods seen: {pbp['period'].unique().tolist()})")
         return result
 
     result["ok"] = True
 
-    for val in q4["SCOREMARGIN"]:
-        margin = parse_margin(val)
+    for _, row in q4.iterrows():
+        margin = compute_margin(row["scoreHome"], row["scoreAway"])
         if margin is None:
             continue
 

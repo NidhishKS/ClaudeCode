@@ -52,7 +52,7 @@ def fetch_play_by_play(game_id: str) -> pd.DataFrame:
     """Return play-by-play rows for a single game."""
     for attempt in range(MAX_RETRIES):
         try:
-            pbp = PlayByPlayV2(game_id=game_id)
+            pbp = PlayByPlayV2(game_id=game_id, timeout=60)
             df = pbp.get_data_frames()[0]
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             return df
@@ -96,6 +96,7 @@ def analyze_game(game_id: str) -> dict:
     """
     result = {
         "ok": False,
+        "error": None,
         "home_trailed_5": False,
         "home_trailed_10": False,
         "away_trailed_5": False,
@@ -105,7 +106,7 @@ def analyze_game(game_id: str) -> dict:
     try:
         pbp = fetch_play_by_play(game_id)
     except Exception as exc:
-        print(f"    WARNING: PBP fetch failed for {game_id}: {exc}")
+        result["error"] = str(exc)
         return result
 
     if pbp.empty:
@@ -188,6 +189,7 @@ def process_season(season: str) -> dict:
     total = len(game_ids)
     stats["skipped_info"] = 0
     stats["failed_pbp"] = 0
+    stats["first_pbp_error"] = None
     print(f"  Processing {total} games for {season}...")
 
     for idx, game_id in enumerate(game_ids, 1):
@@ -209,6 +211,8 @@ def process_season(season: str) -> dict:
         result = analyze_game(game_id)
         if not result["ok"]:
             stats["failed_pbp"] += 1
+            if stats["first_pbp_error"] is None and result["error"]:
+                stats["first_pbp_error"] = result["error"]
             continue
 
         stats["total_games"] += 1
@@ -314,6 +318,8 @@ def main():
                 f"trailed 5+: {stats['games_trailed_5']} games, {stats['comeback_wins_5']} wins | "
                 f"trailed 10+: {stats['games_trailed_10']} games, {stats['comeback_wins_10']} wins"
             )
+            if stats["first_pbp_error"]:
+                print(f"  First PBP error: {stats['first_pbp_error']}")
 
     print("\n========== NBA PLAYOFF Q4 COMEBACK ANALYSIS ==========\n")
     print_results(all_stats)

@@ -80,14 +80,27 @@ def parse_margin(val) -> float | None:
         return None
 
 
-def analyze_game(game_id: str, home_team_won: bool) -> dict:
+def analyze_game(game_id: str) -> dict:
     """
-    Fetch Q4 play-by-play and determine whether the winner ever trailed
-    by 5+ or 10+ at any point in the 4th quarter.
+    Fetch Q4 play-by-play and determine, independently for each team,
+    whether they trailed by 5+ or 10+ at any point in the 4th quarter.
 
-    Returns dict: {ok, trailed_5, trailed_10}
+    Margin is always from the home team's perspective (positive = home leading).
+
+    Returns dict:
+        ok                 – play-by-play was valid
+        home_trailed_5     – home team was ever down 5+ in Q4
+        home_trailed_10    – home team was ever down 10+ in Q4
+        away_trailed_5     – away team was ever down 5+ in Q4
+        away_trailed_10    – away team was ever down 10+ in Q4
     """
-    result = {"ok": False, "trailed_5": False, "trailed_10": False}
+    result = {
+        "ok": False,
+        "home_trailed_5": False,
+        "home_trailed_10": False,
+        "away_trailed_5": False,
+        "away_trailed_10": False,
+    }
 
     try:
         pbp = fetch_play_by_play(game_id)
@@ -111,21 +124,17 @@ def analyze_game(game_id: str, home_team_won: bool) -> dict:
         if margin is None:
             continue
 
-        if home_team_won:
-            # Home won — check if home was ever trailing (margin <= -N)
-            if margin <= -5:
-                result["trailed_5"] = True
-            if margin <= -10:
-                result["trailed_10"] = True
-        else:
-            # Away won — check if away was ever trailing (margin >= +N)
-            if margin >= 5:
-                result["trailed_5"] = True
-            if margin >= 10:
-                result["trailed_10"] = True
+        # margin <= -N  →  home is trailing by N+
+        if margin <= -5:
+            result["home_trailed_5"] = True
+        if margin <= -10:
+            result["home_trailed_10"] = True
 
-        if result["trailed_5"] and result["trailed_10"]:
-            break  # both flags set; no need to scan further
+        # margin >= +N  →  away is trailing by N+
+        if margin >= 5:
+            result["away_trailed_5"] = True
+        if margin >= 10:
+            result["away_trailed_10"] = True
 
     return result
 
@@ -135,8 +144,10 @@ def process_season(season: str) -> dict:
     stats = {
         "season": season,
         "total_games": 0,
-        "comebacks_from_5": 0,
-        "comebacks_from_10": 0,
+        "games_trailed_5": 0,   # games where any team trailed 5+ in Q4
+        "comeback_wins_5": 0,   # of those, games won by the trailing team
+        "games_trailed_10": 0,
+        "comeback_wins_10": 0,
     }
 
     game_log = fetch_playoff_games(season)
@@ -190,15 +201,34 @@ def process_season(season: str) -> dict:
         if idx % 10 == 0 or idx == total:
             print(f"    [{idx}/{total}] game {game_id}")
 
-        result = analyze_game(game_id, home_team_won)
+        result = analyze_game(game_id)
         if not result["ok"]:
             continue
 
         stats["total_games"] += 1
-        if result["trailed_5"]:
-            stats["comebacks_from_5"] += 1
-        if result["trailed_10"]:
-            stats["comebacks_from_10"] += 1
+
+        any_trailed_5 = result["home_trailed_5"] or result["away_trailed_5"]
+        any_trailed_10 = result["home_trailed_10"] or result["away_trailed_10"]
+
+        # Did the team that trailed eventually win?
+        winner_trailed_5 = (
+            (home_team_won and result["home_trailed_5"]) or
+            (not home_team_won and result["away_trailed_5"])
+        )
+        winner_trailed_10 = (
+            (home_team_won and result["home_trailed_10"]) or
+            (not home_team_won and result["away_trailed_10"])
+        )
+
+        if any_trailed_5:
+            stats["games_trailed_5"] += 1
+        if winner_trailed_5:
+            stats["comeback_wins_5"] += 1
+
+        if any_trailed_10:
+            stats["games_trailed_10"] += 1
+        if winner_trailed_10:
+            stats["comeback_wins_10"] += 1
 
     return stats
 
@@ -213,11 +243,11 @@ def demo_mode():
     Useful for verifying output format without live API access.
     """
     print("Running in DEMO MODE — synthetic data only\n")
-    # Approximate real-world rates: ~35-40% trail 5+, ~15-20% trail 10+
+    # Approximate real-world rates for illustration
     synthetic = [
-        {"season": "2022-23", "total_games": 82, "comebacks_from_5": 29, "comebacks_from_10": 13},
-        {"season": "2023-24", "total_games": 85, "comebacks_from_5": 32, "comebacks_from_10": 15},
-        {"season": "2024-25", "total_games": 78, "comebacks_from_5": 27, "comebacks_from_10": 11},
+        {"season": "2022-23", "total_games": 82, "games_trailed_5": 61, "comeback_wins_5": 29, "games_trailed_10": 34, "comeback_wins_10": 13},
+        {"season": "2023-24", "total_games": 85, "games_trailed_5": 64, "comeback_wins_5": 32, "games_trailed_10": 37, "comeback_wins_10": 15},
+        {"season": "2024-25", "total_games": 78, "games_trailed_5": 58, "comeback_wins_5": 27, "games_trailed_10": 31, "comeback_wins_10": 11},
     ]
     return synthetic
 
@@ -230,28 +260,32 @@ def print_results(all_stats: list[dict]) -> None:
     rows = []
     for s in all_stats:
         total = s["total_games"]
-        c5 = s["comebacks_from_5"]
-        c10 = s["comebacks_from_10"]
-        pct5 = (c5 / total * 100) if total > 0 else 0.0
-        pct10 = (c10 / total * 100) if total > 0 else 0.0
-        rows.append(
-            [
-                s["season"],
-                total,
-                c5,
-                f"{pct5:.1f}%",
-                c10,
-                f"{pct10:.1f}%",
-            ]
-        )
+        t5  = s["games_trailed_5"]
+        w5  = s["comeback_wins_5"]
+        t10 = s["games_trailed_10"]
+        w10 = s["comeback_wins_10"]
+        pct5  = (w5  / t5  * 100) if t5  > 0 else 0.0
+        pct10 = (w10 / t10 * 100) if t10 > 0 else 0.0
+        rows.append([
+            s["season"],
+            total,
+            t5,
+            w5,
+            f"{pct5:.1f}%",
+            t10,
+            w10,
+            f"{pct10:.1f}%",
+        ])
 
     headers = [
         "Season",
         "Total Games",
-        "Trailed 5+ & Won",
-        "%",
-        "Trailed 10+ & Won",
-        "%",
+        "Games w/ 5+ trail in Q4",
+        "Comeback Wins (5+)",
+        "Win %",
+        "Games w/ 10+ trail in Q4",
+        "Comeback Wins (10+)",
+        "Win %",
     ]
     print(tabulate(rows, headers=headers, tablefmt="github"))
     print()
@@ -269,9 +303,9 @@ def main():
             stats = process_season(season)
             all_stats.append(stats)
             print(
-                f"  Done — {stats['total_games']} games, "
-                f"{stats['comebacks_from_5']} trailed 5+, "
-                f"{stats['comebacks_from_10']} trailed 10+"
+                f"  Done — {stats['total_games']} games | "
+                f"trailed 5+: {stats['games_trailed_5']} games, {stats['comeback_wins_5']} wins | "
+                f"trailed 10+: {stats['games_trailed_10']} games, {stats['comeback_wins_10']} wins"
             )
 
     print("\n========== NBA PLAYOFF Q4 COMEBACK ANALYSIS ==========\n")
